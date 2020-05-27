@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package mbproto;
+
+service MessageBroker {
+  rpc Produce (stream ProduceRequest) returns (ProduceResponse);
+  rpc Consume (stream ConsumeRequest) returns (stream ConsumeResponse);
+}
+
+message ConsumeRequest {
+  enum Action {
+    SUBSCRIBE = 0;
+    UNSUBSCRIBE = 1;
+  };
+
+  Action action = 1;
+  // Keys is a list of words divided by dot. May be specified as exact key or pattern.
+  // Word should contain only 0-9a-zA-Z characters.
+  // Instead of word may be specified:
+  // * (star) can substitute for exactly one word.
+  // # (hash) can substitute for zero or more words.
+  repeated string keys = 2;
+}
+
+message ConsumeResponse {
+  // Key is a list of words divided by dot. Word should contain only 0-9a-zA-Z characters.
+  // For example: aaa, aaa.bbb, ccc.123.ddd, etc.
+  string key = 1;
+  bytes payload = 2;
+}
+
+message ProduceRequest {
+  // Key is a list of words divided by dot. Word should contain only 0-9a-zA-Z characters.
+  // For example: aaa, aaa.bbb, ccc.123.ddd, etc.
+  string key = 1;
+  bytes payload = 2;
+}
+
+message ProduceResponse {}
