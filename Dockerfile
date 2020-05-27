@@ -6,7 +6,7 @@ COPY go.mod .
 COPY go.sum .
 RUN go mod download
 COPY ./ ./
-RUN cd /src && go build -o ./bin/mbs ./cmd
+RUN cd /src && go build -o ./bin/mbs ./main.go
 
 FROM alpine
 RUN apk update && apk add ca-certificates && rm -rf /var/cache/apk/*
