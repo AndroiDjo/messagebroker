@@ -24,8 +24,10 @@ type consumer struct {
 	subs     map[string]*regexp.Regexp
 	msgqueue []consuMsg
 	mux      sync.Mutex
+	idx      int
 }
 
+var globIndex int = 0
 var matcherfunc func(string) *regexp.Regexp = getMatcher()
 var consumeRegister []*consumer = make([]*consumer, 10)
 
@@ -52,16 +54,19 @@ func (s server) Produce(srv pb.MessageBroker_ProduceServer) error {
 		if len(req.Key) > 0 {
 			for _, c := range consumeRegister {
 				if c != nil {
-					c.mux.Lock()
-					for _, element := range c.subs {
-						if element != nil {
-							if element.MatchString(req.Key) {
-								c.msgqueue = append(c.msgqueue, consuMsg{key: req.Key, payload: req.Payload})
-								break
+					go func(key string, pl []byte, c *consumer) {
+						c.mux.Lock()
+						for _, element := range c.subs {
+							if element != nil {
+								if element.MatchString(key) {
+									fmt.Println("produce add msg to queue:", c.idx, key)
+									c.msgqueue = append(c.msgqueue, consuMsg{key: key, payload: pl})
+									break
+								}
 							}
 						}
-					}
-					c.mux.Unlock()
+						c.mux.Unlock()
+					}(req.Key, req.Payload, c)
 				}
 			}
 		}
@@ -70,7 +75,8 @@ func (s server) Produce(srv pb.MessageBroker_ProduceServer) error {
 
 func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 	ctx := srv.Context()
-	cons := consumer{subs: make(map[string]*regexp.Regexp)}
+	cons := consumer{subs: make(map[string]*regexp.Regexp), idx: globIndex}
+	globIndex++
 	consumeRegister = append(consumeRegister, &cons)
 	for {
 		select {
@@ -79,15 +85,20 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 		default:
 		}
 
-		cons.mux.Lock()
-		for _, msg := range cons.msgqueue {
-			resp := pb.ConsumeResponse{Key: msg.key, Payload: msg.payload}
-			if err := srv.Send(&resp); err != nil {
-				log.Printf("Consume send error %v", err)
-			}
+		for len(cons.msgqueue) > 0 {
+			// TODO: try not use lock here
+			cons.mux.Lock()
+			cm := cons.msgqueue[0]
+			cons.msgqueue = cons.msgqueue[1:]
+			cons.mux.Unlock()
+			go func(msg consuMsg) {
+				resp := pb.ConsumeResponse{Key: msg.key, Payload: msg.payload}
+				fmt.Println("consumer recieve msg:", msg.key)
+				if err := srv.Send(&resp); err != nil {
+					log.Printf("Consume send error %v", err)
+				}
+			}(cm)
 		}
-		cons.msgqueue = cons.msgqueue[:0]
-		cons.mux.Unlock()
 
 		req, err := srv.Recv()
 		if err == io.EOF {
@@ -95,21 +106,24 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 		}
 		if err != nil {
 			log.Printf("Consume receive error %v", err)
-			continue
+			//continue
+			return ctx.Err()
 		}
 
-		if len(req.Keys) > 0 {
-			cons.mux.Lock()
-			if req.Action == pb.ConsumeRequest_SUBSCRIBE {
-				for _, key := range req.Keys {
-					cons.subs[key] = matcherfunc(key)
+		for _, key := range req.Keys {
+			go func(action pb.ConsumeRequest_Action, k string, c *consumer) {
+				switch action {
+				case pb.ConsumeRequest_SUBSCRIBE:
+					matcher := makeMatcher(k)
+					c.mux.Lock()
+					c.subs[k] = matcher
+					c.mux.Unlock()
+				case pb.ConsumeRequest_UNSUBSCRIBE:
+					c.mux.Lock()
+					c.subs[k] = nil
+					c.mux.Unlock()
 				}
-			} else if req.Action == pb.ConsumeRequest_UNSUBSCRIBE {
-				for _, key := range req.Keys {
-					cons.subs[key] = nil
-				}
-			}
-			cons.mux.Unlock()
+			}(req.Action, key, &cons)
 		}
 	}
 }
@@ -130,26 +144,33 @@ func makeMatcher(s string) *regexp.Regexp {
 	//result = strings.TrimPrefix(result, `\.`)
 	result = strings.TrimSuffix(result, `\.`)
 	result = "^" + result + "$"
+	fmt.Println("new matcher", s, result)
 	var expr = regexp.MustCompile(result)
 	return expr
 }
 
 func getMatcher() func(string) *regexp.Regexp {
 	matchers := make(map[string]*regexp.Regexp)
+	var mux sync.Mutex
 	return func(s string) *regexp.Regexp {
+		mux.Lock()
 		elem, ok := matchers[s]
+		mux.Unlock()
 		if ok {
 			return elem
 		} else {
 			newMatcher := makeMatcher(s)
+			mux.Lock()
 			matchers[s] = newMatcher
+			mux.Unlock()
 			return newMatcher
 		}
 	}
 }
 
 func main() {
-	lis, err := net.Listen("tcp", ":80")
+	port := ":80"
+	lis, err := net.Listen("tcp", port)
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
@@ -158,7 +179,7 @@ func main() {
 	s := grpc.NewServer()
 	pb.RegisterMessageBrokerServer(s, server{})
 
-	fmt.Println("Server started successfully")
+	fmt.Println("Server started successfully at port ", port)
 
 	// and start...
 	if err := s.Serve(lis); err != nil {
