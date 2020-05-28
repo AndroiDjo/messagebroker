@@ -15,21 +15,8 @@ import (
 
 type server struct{}
 
-type consuMsg struct {
-	key     string
-	payload []byte
-}
-
-type consumer struct {
-	subs     map[string]*regexp.Regexp
-	msgqueue []consuMsg
-	mux      sync.Mutex
-	idx      int
-}
-
-var globIndex int = 0
+var chanlist []chan *pb.ProduceRequest
 var matcherfunc func(string) *regexp.Regexp = getMatcher()
-var consumeRegister []*consumer = make([]*consumer, 10)
 
 func (s server) Produce(srv pb.MessageBroker_ProduceServer) error {
 	ctx := srv.Context()
@@ -51,7 +38,10 @@ func (s server) Produce(srv pb.MessageBroker_ProduceServer) error {
 			continue
 		}
 
-		if len(req.Key) > 0 {
+		for _, ch := range chanlist {
+			ch <- req
+		}
+		/*if len(req.Key) > 0 {
 			for _, c := range consumeRegister {
 				if c != nil {
 					go func(key string, pl []byte, c *consumer) {
@@ -59,7 +49,7 @@ func (s server) Produce(srv pb.MessageBroker_ProduceServer) error {
 						for _, element := range c.subs {
 							if element != nil {
 								if element.MatchString(key) {
-									fmt.Println("produce add msg to queue:", c.idx, key)
+									//fmt.Println("produce add msg to queue:", c.idx, key)
 									c.msgqueue = append(c.msgqueue, consuMsg{key: key, payload: pl})
 									break
 								}
@@ -69,49 +59,96 @@ func (s server) Produce(srv pb.MessageBroker_ProduceServer) error {
 					}(req.Key, req.Payload, c)
 				}
 			}
-		}
+		}*/
 	}
 }
 
 func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 	ctx := srv.Context()
-	cons := consumer{subs: make(map[string]*regexp.Regexp), idx: globIndex}
-	globIndex++
-	consumeRegister = append(consumeRegister, &cons)
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
 
-		for len(cons.msgqueue) > 0 {
-			// TODO: try not use lock here
-			cons.mux.Lock()
-			cm := cons.msgqueue[0]
-			cons.msgqueue = cons.msgqueue[1:]
-			cons.mux.Unlock()
-			go func(msg consuMsg) {
-				resp := pb.ConsumeResponse{Key: msg.key, Payload: msg.payload}
-				fmt.Println("consumer recieve msg:", msg.key)
-				if err := srv.Send(&resp); err != nil {
-					log.Printf("Consume send error %v", err)
+	var exparr []*regexp.Regexp = make([]*regexp.Regexp, 1)
+	var keyarr []string = make([]string, 1)
+	var msgchan chan *pb.ProduceRequest = make(chan *pb.ProduceRequest, 1000)
+	chanlist = append(chanlist, msgchan)
+
+	go func() {
+		for {
+			m := <-msgchan
+			var ea []*regexp.Regexp
+			copy(ea, exparr)
+			for _, exp := range ea {
+				if exp.MatchString(m.Key) {
+					resp := pb.ConsumeResponse{Key: m.Key, Payload: m.Payload}
+					if err := srv.Send(&resp); err != nil {
+						log.Printf("Consume send error %v", err)
+					}
+					break
 				}
-			}(cm)
-		}
+			}
 
-		req, err := srv.Recv()
-		if err == io.EOF {
-			continue
 		}
-		if err != nil {
-			log.Printf("Consume receive error %v", err)
-			//continue
-			return ctx.Err()
-		}
+	}()
 
-		for _, key := range req.Keys {
-			go func(action pb.ConsumeRequest_Action, k string, c *consumer) {
+	go func() {
+		for {
+			/*select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}*/
+
+			/*for len(cons.msgqueue) > 0 {
+				// TODO: try not use lock here
+				cons.mux.Lock()
+				cm := cons.msgqueue[0]
+				cons.msgqueue = cons.msgqueue[1:]
+				cons.mux.Unlock()
+				go func(msg consuMsg) {
+					resp := pb.ConsumeResponse{Key: msg.key, Payload: msg.payload}
+					//fmt.Println("consumer recieve msg:", msg.key)
+					if err := srv.Send(&resp); err != nil {
+						log.Printf("Consume send error %v", err)
+					}
+				}(cm)
+			}*/
+
+			req, err := srv.Recv()
+			if err == io.EOF || req == nil {
+				continue
+			}
+
+			switch req.Action {
+			case pb.ConsumeRequest_SUBSCRIBE:
+				for _, key := range req.Keys {
+					found := false
+					for _, s := range keyarr {
+						if key == s {
+							found = true
+							break
+						}
+					}
+					if !found {
+						expr := makeMatcher(key)
+						exparr = append(exparr, expr)
+						keyarr = append(keyarr, key)
+					}
+				}
+			case pb.ConsumeRequest_UNSUBSCRIBE:
+				for _, key := range req.Keys {
+					for i, s := range keyarr {
+						if key == s {
+							lk := len(keyarr)
+							keyarr[i], keyarr = keyarr[lk-1], keyarr[:lk-1]
+
+							le := len(exparr)
+							exparr[i], exparr = exparr[le-1], exparr[:le-1]
+							//exparr = append(exparr[:i], exparr[i+1:]...)
+						}
+					}
+				}
+			}
+
+			/*go func(action pb.ConsumeRequest_Action, k string, c *consumer) {
 				switch action {
 				case pb.ConsumeRequest_SUBSCRIBE:
 					matcher := makeMatcher(k)
@@ -123,9 +160,13 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 					c.subs[k] = nil
 					c.mux.Unlock()
 				}
-			}(req.Action, key, &cons)
+			}(req.Action, key, &cons)*/
+
 		}
-	}
+	}()
+
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func makeMatcher(s string) *regexp.Regexp {
@@ -144,7 +185,7 @@ func makeMatcher(s string) *regexp.Regexp {
 	//result = strings.TrimPrefix(result, `\.`)
 	result = strings.TrimSuffix(result, `\.`)
 	result = "^" + result + "$"
-	fmt.Println("new matcher", s, result)
+	//fmt.Println("new matcher", s, result)
 	var expr = regexp.MustCompile(result)
 	return expr
 }
