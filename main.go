@@ -39,6 +39,7 @@ func (s server) Produce(srv pb.MessageBroker_ProduceServer) error {
 		}
 
 		for _, ch := range chanlist {
+			//fmt.Println("req added to channel:", req)
 			ch <- req
 		}
 		/*if len(req.Key) > 0 {
@@ -73,16 +74,22 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 
 	go func() {
 		for {
+			//fmt.Println("sendmsg 1")
 			m := <-msgchan
-			var ea []*regexp.Regexp
+			var ea []*regexp.Regexp = make([]*regexp.Regexp, len(exparr))
 			copy(ea, exparr)
+			//fmt.Println("sendmsg 2", m)
 			for _, exp := range ea {
-				if exp.MatchString(m.Key) {
-					resp := pb.ConsumeResponse{Key: m.Key, Payload: m.Payload}
-					if err := srv.Send(&resp); err != nil {
-						log.Printf("Consume send error %v", err)
+				if exp != nil {
+					//fmt.Println("send msg to client:", exp, m.Key)
+					if exp.MatchString(m.Key) {
+						resp := pb.ConsumeResponse{Key: m.Key, Payload: m.Payload}
+						//fmt.Println("exp matches! resp:", resp)
+						if err := srv.Send(&resp); err != nil {
+							log.Printf("Consume send error %v", err)
+						}
+						break
 					}
-					break
 				}
 			}
 
@@ -131,12 +138,14 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 						expr := makeMatcher(key)
 						exparr = append(exparr, expr)
 						keyarr = append(keyarr, key)
+						//fmt.Println("new matcher:", key)
 					}
 				}
 			case pb.ConsumeRequest_UNSUBSCRIBE:
 				for _, key := range req.Keys {
 					for i, s := range keyarr {
 						if key == s {
+							//fmt.Println("remove matcher:", key)
 							lk := len(keyarr)
 							keyarr[i], keyarr = keyarr[lk-1], keyarr[:lk-1]
 
