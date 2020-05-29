@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	pb "github.com/AndroiDjo/newbroker/mbproto"
 	"google.golang.org/grpc"
@@ -30,7 +31,33 @@ type consumer struct {
 	queue chan *myrequest
 }
 
-var consRegistry []*consumer = make([]*consumer, 0)
+var consRegistry []*consumer
+var subsRegistry []*consub
+
+func clearUnusedSubs() {
+	for {
+		<-time.After(time.Second)
+		for i, v := range subsRegistry {
+			found := false
+			for _, cons := range consRegistry {
+				if cons != nil {
+					for _, sub := range cons.subs {
+						if v == sub {
+							found = true
+							break
+						}
+					}
+					if found {
+						break
+					}
+				}
+			}
+			if !found {
+				subsRegistry = removeConSlice(subsRegistry, i)
+			}
+		}
+	}
+}
 
 func (s server) Produce(srv pb.MessageBroker_ProduceServer) error {
 	ctx := srv.Context()
@@ -52,6 +79,26 @@ func (s server) Produce(srv pb.MessageBroker_ProduceServer) error {
 			return nil
 		}
 
+		/*go func() {
+			for _, sub := range subsRegistry {
+				if sub != nil {
+					match := false
+					if sub.matcher != nil {
+						if sub.matcher.MatchString(req.Key) {
+							match = true
+						}
+					} else if sub.key == req.Key {
+						match = true
+					}
+					if match {
+						for _, c := range sub.msgchan {
+							r := myrequest{key: req.Key, payload: req.Payload}
+							c <- &r
+						}
+					}
+				}
+			}
+		}()*/
 		go func(rq *pb.ProduceRequest) {
 			for _, cons := range consRegistry {
 				for _, sub := range cons.subs {
@@ -116,6 +163,75 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 			switch req.Action {
 			case pb.ConsumeRequest_SUBSCRIBE:
 				for _, key := range req.Keys {
+					foundregistry := false
+					for _, sr := range subsRegistry {
+						if sr != nil {
+							if key == sr.key {
+								foundregistry = true
+								foundprivate := false
+								for _, s := range cons.subs {
+									if sr == s {
+										foundprivate = true
+										break
+									}
+								}
+								if !foundprivate {
+									cons.subs = append(cons.subs, sr)
+								}
+								break
+							}
+						}
+					}
+					if !foundregistry {
+						sub := consub{key: key}
+						if strings.Contains(key, "*") || strings.Contains(key, "#") {
+							sub.matcher = makeMatcher(key)
+						}
+						cons.subs = append(cons.subs, &sub)
+						subsRegistry = append(subsRegistry, &sub)
+					}
+
+					/*found := false
+					for _, s := range cons.subs {
+						if key == s.key {
+							found = true
+							break
+						}
+					}
+					if !found {
+						sub := consub{key: key}
+						if strings.Contains(key, "*") || strings.Contains(key, "#") {
+							sub.matcher = makeMatcher(key)
+						}
+						cons.subs = append(cons.subs, &sub)
+					}*/
+				}
+			case pb.ConsumeRequest_UNSUBSCRIBE:
+				for _, key := range req.Keys {
+					for i, s := range cons.subs {
+						if key == s.key {
+							cons.subs = removeConSlice(cons.subs, i)
+						}
+					}
+				}
+			}
+		}
+	}()
+	/*go func() {
+		for {
+			req, err := srv.Recv()
+			if err == io.EOF {
+				continue
+			}
+			if err != nil {
+				log.Printf("Consumer request error %v", err)
+				closechan <- true
+				return
+			}
+
+			switch req.Action {
+			case pb.ConsumeRequest_SUBSCRIBE:
+				for _, key := range req.Keys {
 					found := false
 					for _, s := range cons.subs {
 						if key == s.key {
@@ -142,23 +258,8 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 					}
 				}
 			}
-
-			/*go func(action pb.ConsumeRequest_Action, k string, c *consumer) {
-				switch action {
-				case pb.ConsumeRequest_SUBSCRIBE:
-					matcher := makeMatcher(k)
-					c.mux.Lock()
-					c.subs[k] = matcher
-					c.mux.Unlock()
-				case pb.ConsumeRequest_UNSUBSCRIBE:
-					c.mux.Lock()
-					c.subs[k] = nil
-					c.mux.Unlock()
-				}
-			}(req.Action, key, &cons)*/
-
 		}
-	}()
+	}()*/
 
 	select {
 	case <-ctx.Done():
@@ -166,6 +267,11 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 	case <-exitchan:
 		return nil
 	}
+}
+
+func removeConSlice(s []*consub, i int) []*consub {
+	s[i] = s[len(s)-1]
+	return s[:len(s)-1]
 }
 
 func makeMatcher(s string) *regexp.Regexp {
@@ -221,6 +327,7 @@ func main() {
 
 	fmt.Println("Server started successfully at port ", port)
 
+	go clearUnusedSubs()
 	// and start...
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)

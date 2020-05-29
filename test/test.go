@@ -2,8 +2,6 @@ package main
 
 import (
 	"fmt"
-	"strings"
-	"time"
 )
 
 func fastcompare(str1 string, str2 string) bool {
@@ -28,7 +26,7 @@ func main() {
 	"fkshdlfkjslkdfkhalskhdflkjsdfkljsdlkfjslkdh.slkdfj",
 	"khlskdkfhhksdfkjhslkdjflksjdklfhskdl.flskdhflkhsdl",
 	"hflsyhelihfkhsldhfoishdfs.fhsldhfoiwoie"}*/
-	strings2 := []string{"fsdgsdfsaafasdfddffhls.fsdlkgsdlkjfsd.fsdlfjlskdj",
+	/*strings2 := []string{"fsdgsdfsaafasdfddffhls.fsdlkgsdlkjfsd.fsdlfjlskdj",
 		"fsldhgsdfasdfsdddkjfjsldkjflskdhfs.dflshdglskdjsdl",
 		"khfsldhflsdjf.sdfjlksjd.fjkskdlfjs.dfjkskdjkdkjfkf",
 		"flskhdflkssgsdfasd*fdfgsdfdjfksdjlkfjldkjsflsdkhslk",
@@ -65,5 +63,18 @@ func main() {
 		}
 	}
 	end = time.Now()
-	fmt.Println("custom equals ends in", end.Sub(begin))
+	fmt.Println("custom equals ends in", end.Sub(begin))*/
+
+	mainslice := []int{1, 2, 3, 4, 5}
+	//subslice := mainslice[1:3]
+	subslice := remove(mainslice, 2)
+	fmt.Println(subslice)
+	subslice = append(subslice, 333)
+	fmt.Println(subslice)
+}
+
+func remove(s []int, i int) []int {
+	s[i] = s[len(s)-1]
+	// We do not need to put s[i] at the end, as it will be discarded anyway
+	return s[:len(s)-1]
 }
