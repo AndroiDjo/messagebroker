@@ -15,7 +15,12 @@ import (
 
 type server struct{}
 
-var chanlist []chan *pb.ProduceRequest
+type myrequest struct {
+	key     string
+	payload []byte
+}
+
+var chanlist []chan *myrequest
 var matcherfunc func(string) *regexp.Regexp = getMatcher()
 
 func (s server) Produce(srv pb.MessageBroker_ProduceServer) error {
@@ -35,13 +40,16 @@ func (s server) Produce(srv pb.MessageBroker_ProduceServer) error {
 		}
 		if err != nil {
 			log.Printf("Produce receive error %v", err)
-			continue
+			return nil
 		}
 
-		for _, ch := range chanlist {
-			//fmt.Println("req added to channel:", req)
-			ch <- req
-		}
+		go func(rq *pb.ProduceRequest) {
+			for _, ch := range chanlist {
+				//fmt.Println("req added to channel:", req)
+				r := myrequest{key: rq.Key, payload: rq.Payload}
+				ch <- &r
+			}
+		}(req)
 		/*if len(req.Key) > 0 {
 			for _, c := range consumeRegister {
 				if c != nil {
@@ -69,7 +77,9 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 
 	var exparr []*regexp.Regexp = make([]*regexp.Regexp, 1)
 	var keyarr []string = make([]string, 1)
-	var msgchan chan *pb.ProduceRequest = make(chan *pb.ProduceRequest, 1000)
+	var exitchan chan bool = make(chan bool)
+	var closechan chan bool = make(chan bool)
+	var msgchan chan *myrequest = make(chan *myrequest, 1000)
 	chanlist = append(chanlist, msgchan)
 
 	go func() {
@@ -82,8 +92,8 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 			for _, exp := range ea {
 				if exp != nil {
 					//fmt.Println("send msg to client:", exp, m.Key)
-					if exp.MatchString(m.Key) {
-						resp := pb.ConsumeResponse{Key: m.Key, Payload: m.Payload}
+					if exp.MatchString(m.key) {
+						resp := pb.ConsumeResponse{Key: m.key, Payload: m.payload}
 						//fmt.Println("exp matches! resp:", resp)
 						if err := srv.Send(&resp); err != nil {
 							log.Printf("Consume send error %v", err)
@@ -92,7 +102,12 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 					}
 				}
 			}
-
+			select {
+			case <-closechan:
+				exitchan <- true
+				return
+			default:
+			}
 		}
 	}()
 
@@ -120,8 +135,13 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 			}*/
 
 			req, err := srv.Recv()
-			if err == io.EOF || req == nil {
+			if err == io.EOF {
 				continue
+			}
+			if err != nil {
+				log.Printf("Consumer request error %v", err)
+				closechan <- true
+				return
 			}
 
 			switch req.Action {
@@ -174,8 +194,12 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 		}
 	}()
 
-	<-ctx.Done()
-	return ctx.Err()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-exitchan:
+		return nil
+	}
 }
 
 func makeMatcher(s string) *regexp.Regexp {
