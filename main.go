@@ -24,16 +24,17 @@ type consub struct {
 }
 
 type consumer struct {
-	subs  []*consub
-	queue chan *pb.ProduceRequest
+	//subs  []*consub
+	subkeys  []string
+	subtstar []*consub
+	subtcell []*consub
+	queue    chan *pb.ProduceRequest
 }
 
 var msgQueueChan chan *pb.ProduceRequest = make(chan *pb.ProduceRequest, 10000)
 var consRegistry []*consumer
 var produceCnt int = 0
 var consumeCnt int = 0
-
-//var subsRegistry []*consub
 
 func PrintMemUsage() {
 	var m runtime.MemStats
@@ -57,59 +58,19 @@ func printStats() {
 		fmt.Println("gorutines cnt", runtime.NumGoroutine())
 		fmt.Println("produceCnt", produceCnt)
 		fmt.Println("consumeCnt", consumeCnt)
+		fmt.Println("msgQueueChan", len(msgQueueChan))
 	}
 }
 
-/*func clearUnusedSubs() {
-	for {
-		time.Sleep(time.Second * 5)
-		templcnt := 0
-		maxsubs := 0
-		unusedcnt := 0
-		for i, v := range subsRegistry {
-			if v != nil {
-				if v.matcher != nil {
-					templcnt++
-				}
-			}
-			found := false
-			subscnt := 0
-			for _, cons := range consRegistry {
-				if cons != nil {
-					for _, sub := range cons.subs {
-						if v == sub {
-							subscnt++
-							found = true
-							break
-						}
-					}
-					if found {
-						break
-					}
-				}
-			}
-			if subscnt > maxsubs {
-				maxsubs = subscnt
-			}
-			if !found {
-				unusedcnt++
-				subsRegistry = removeConSlice(subsRegistry, i)
-			}
-		}
-		fmt.Println("subscription stats:", len(subsRegistry), templcnt, maxsubs, unusedcnt)
-		PrintMemUsage()
-	}
-}*/
-
 func (s server) Produce(srv pb.MessageBroker_ProduceServer) error {
-	ctx := srv.Context()
+	//ctx := srv.Context()
 	produceCnt++
 	for {
-		select {
+		/*select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-		}
+		}*/
 
 		req, err := srv.Recv()
 		if err == io.EOF {
@@ -125,53 +86,11 @@ func (s server) Produce(srv pb.MessageBroker_ProduceServer) error {
 		go func(r *pb.ProduceRequest) {
 			msgQueueChan <- r
 		}(req)
-
-		/*go func() {
-			for _, sub := range subsRegistry {
-				if sub != nil {
-					match := false
-					if sub.matcher != nil {
-						if sub.matcher.MatchString(req.Key) {
-							match = true
-						}
-					} else if sub.key == req.Key {
-						match = true
-					}
-					if match {
-						for _, c := range sub.msgchan {
-							r := myrequest{key: req.Key, payload: req.Payload}
-							c <- &r
-						}
-					}
-				}
-			}
-		}()*/
-		/*go func(rq *pb.ProduceRequest) {
-			for _, cons := range consRegistry {
-				for _, sub := range cons.subs {
-					if sub != nil {
-						match := false
-						if sub.matcher != nil {
-							if sub.matcher.MatchString(rq.Key) {
-								match = true
-							}
-						} else if sub.key == rq.Key {
-							match = true
-						}
-						if match {
-							r := myrequest{key: rq.Key, payload: rq.Payload}
-							cons.queue <- &r
-							break
-						}
-					}
-				}
-			}
-		}(req)*/
 	}
 }
 
 func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
-	ctx := srv.Context()
+	//ctx := srv.Context()
 	consumeCnt++
 	var exitchan chan bool = make(chan bool)
 	var closechan chan bool = make(chan bool)
@@ -200,7 +119,8 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 		for {
 			req, err := srv.Recv()
 			if err == io.EOF {
-				continue
+				closechan <- true
+				return
 			}
 			if err != nil {
 				//log.Printf("Consumer request error %v", err)
@@ -210,80 +130,75 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 
 			switch req.Action {
 			case pb.ConsumeRequest_SUBSCRIBE:
-				for i, _ := range req.Keys {
+				for _, key := range req.Keys {
 					found := false
-					for _, s := range cons.subs {
-						if req.Keys[i] == s.key {
+					for _, s := range cons.subtcell {
+						if key == s.key {
+							found = true
+							break
+						}
+					}
+					for _, s := range cons.subtstar {
+						if key == s.key {
+							found = true
+							break
+						}
+					}
+					for idx, _ := range cons.subkeys {
+						if key == cons.subkeys[idx] {
 							found = true
 							break
 						}
 					}
 					if !found {
-						sub := consub{key: req.Keys[i]}
-						if strings.Contains(req.Keys[i], "*") || strings.Contains(req.Keys[i], "#") {
-							sub.matcher = makeMatcher(req.Keys[i])
+						if strings.Contains(key, "#") {
+							sub := consub{key: key, matcher: makeMatcher(key)}
+							cons.subtcell = append(cons.subtcell, &sub)
+						} else if strings.Contains(key, "*") {
+							sub := consub{key: key, matcher: makeMatcher(key)}
+							cons.subtstar = append(cons.subtstar, &sub)
+						} else {
+							cons.subkeys = append(cons.subkeys, key)
 						}
-						cons.subs = append(cons.subs, &sub)
 					}
 				}
 			case pb.ConsumeRequest_UNSUBSCRIBE:
-				for idx, _ := range req.Keys {
-					for i, s := range cons.subs {
-						if req.Keys[idx] == s.key {
-							cons.subs = removeConSlice(cons.subs, i)
+				for _, key := range req.Keys {
+					removed := false
+					for i, s := range cons.subtcell {
+						if key == s.key {
+							cons.subtcell = removeConSlice(cons.subtcell, i)
+							removed = true
+							break
+						}
+					}
+					if !removed {
+						for i, s := range cons.subtstar {
+							if key == s.key {
+								cons.subtstar = removeConSlice(cons.subtstar, i)
+								removed = true
+								break
+							}
+						}
+					}
+					if !removed {
+						for i, _ := range cons.subkeys {
+							if key == cons.subkeys[i] {
+								ls := len(cons.subkeys)
+								cons.subkeys[i] = cons.subkeys[ls-1]
+								cons.subkeys = cons.subkeys[:ls-1]
+								break
+							}
 						}
 					}
 				}
 			}
 		}
 	}()
-	/*go func() {
-		for {
-			req, err := srv.Recv()
-			if err == io.EOF {
-				continue
-			}
-			if err != nil {
-				log.Printf("Consumer request error %v", err)
-				closechan <- true
-				return
-			}
-
-			switch req.Action {
-			case pb.ConsumeRequest_SUBSCRIBE:
-				for _, key := range req.Keys {
-					found := false
-					for _, s := range cons.subs {
-						if key == s.key {
-							found = true
-							break
-						}
-					}
-					if !found {
-						sub := consub{key: key}
-						if strings.Contains(key, "*") || strings.Contains(key, "#") {
-							sub.matcher = makeMatcher(key)
-						}
-						cons.subs = append(cons.subs, &sub)
-					}
-				}
-			case pb.ConsumeRequest_UNSUBSCRIBE:
-				for _, key := range req.Keys {
-					for i, s := range cons.subs {
-						if key == s.key {
-							//fmt.Println("remove matcher:", key)
-							lk := len(cons.subs)
-							cons.subs[i], cons.subs = cons.subs[lk-1], cons.subs[:lk-1]
-						}
-					}
-				}
-			}
-		}
-	}()*/
 
 	select {
-	case <-ctx.Done():
-		return ctx.Err()
+	/*case <-ctx.Done():
+	return ctx.Err()*/
 	case <-exitchan:
 		return nil
 	}
@@ -294,7 +209,47 @@ func processMsgQueue() {
 		req := <-msgQueueChan
 		for _, cons := range consRegistry {
 			if cons != nil {
-				for _, sub := range cons.subs {
+				match := false
+				for _, sub := range cons.subtcell {
+					if sub != nil {
+						if sub.matcher != nil {
+							if sub.matcher.MatchString(req.Key) {
+								match = true
+								break
+							}
+						}
+					}
+				}
+				if !match {
+					for _, sub := range cons.subtstar {
+						if sub != nil {
+							if sub.matcher != nil {
+								if sub.matcher.MatchString(req.Key) {
+									match = true
+									break
+								}
+							}
+						}
+					}
+				}
+				if !match {
+					for _, key := range cons.subkeys {
+						if key == req.Key {
+							match = true
+							break
+						}
+					}
+				}
+				if match {
+					cons.queue <- req
+				}
+			}
+		}
+	}
+}
+
+/*
+for _, sub := range cons.subtcell {
 					if sub != nil {
 						match := false
 						if sub.matcher != nil {
@@ -310,11 +265,7 @@ func processMsgQueue() {
 						}
 					}
 				}
-			}
-		}
-	}
-}
-
+*/
 func removeConSlice(s []*consub, i int) []*consub {
 	s[i] = s[len(s)-1]
 	return s[:len(s)-1]
@@ -364,6 +315,8 @@ func main() {
 	go printStats()
 	fmt.Println("numcpu", runtime.NumCPU())
 	fmt.Println("gomaxprocs", runtime.GOMAXPROCS(-1))
+	/*runtime.GOMAXPROCS(256)
+	fmt.Println("gomaxprocs", runtime.GOMAXPROCS(-1))*/
 
 	port := ":80"
 	lis, err := net.Listen("tcp", port)
@@ -377,7 +330,7 @@ func main() {
 
 	fmt.Println("Server started successfully at port ", port)
 
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < 100000; i++ {
 		go processMsgQueue()
 	}
 	// and start...
