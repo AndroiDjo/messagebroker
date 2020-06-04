@@ -19,22 +19,26 @@ import (
 type server struct{}
 
 type consub struct {
-	key     string
-	matcher *regexp.Regexp
+	matcher   *regexp.Regexp
+	consumers []*consumer
 }
 
 type consumer struct {
-	//subs  []*consub
-	subkeys  []string
-	subtstar []*consub
-	subtcell []*consub
-	queue    chan *pb.ProduceRequest
+	queue chan *pb.ProduceRequest
+	mux   sync.Mutex
 }
+
+var directsubsmap map[string][]*consumer = make(map[string][]*consumer)
+var ptrsubsmap map[string]*consub = make(map[string]*consub)
+var onewordkeymap map[string][]*consub = make(map[string][]*consub)
 
 var msgQueueChan chan *pb.ProduceRequest = make(chan *pb.ProduceRequest, 10000)
 var consRegistry []*consumer
 var produceCnt int = 0
 var consumeCnt int = 0
+var gmux sync.Mutex
+var ptrmux sync.Mutex
+var onewordmux sync.Mutex
 
 func PrintMemUsage() {
 	var m runtime.MemStats
@@ -83,9 +87,7 @@ func (s server) Produce(srv pb.MessageBroker_ProduceServer) error {
 			return nil
 		}
 
-		go func(r *pb.ProduceRequest) {
-			msgQueueChan <- r
-		}(req)
+		msgQueueChan <- req
 	}
 }
 
@@ -131,64 +133,117 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 			switch req.Action {
 			case pb.ConsumeRequest_SUBSCRIBE:
 				for _, key := range req.Keys {
-					found := false
-					for _, s := range cons.subtcell {
-						if key == s.key {
-							found = true
-							break
-						}
-					}
-					for _, s := range cons.subtstar {
-						if key == s.key {
-							found = true
-							break
-						}
-					}
-					for idx, _ := range cons.subkeys {
-						if key == cons.subkeys[idx] {
-							found = true
-							break
-						}
-					}
-					if !found {
-						if strings.Contains(key, "#") {
-							sub := consub{key: key, matcher: makeMatcher(key)}
-							cons.subtcell = append(cons.subtcell, &sub)
-						} else if strings.Contains(key, "*") {
-							sub := consub{key: key, matcher: makeMatcher(key)}
-							cons.subtstar = append(cons.subtstar, &sub)
+					if strings.Contains(key, "#") || strings.Contains(key, "*") {
+						//ptrsubsmap
+						ptrmux.Lock()
+						cs := ptrsubsmap[key]
+						ptrmux.Unlock()
+						if cs != nil {
+							found := false
+							for _, con := range cs.consumers {
+								if con == &cons {
+									found = true
+									break
+								}
+							}
+							if !found {
+								cs.consumers = append(cs.consumers, &cons)
+								// TODO: check to not write back to ptrsubsmap
+								ptrmux.Lock()
+								ptrsubsmap[key] = cs
+								ptrmux.Unlock()
+							}
 						} else {
-							cons.subkeys = append(cons.subkeys, key)
+							cs = &consub{matcher: makeMatcher(key), consumers: []*consumer{&cons}}
+							ptrmux.Lock()
+							ptrsubsmap[key] = cs
+							ptrmux.Unlock()
+							for _, word := range strings.Split(key, ".") {
+								if word != "#" && word != "*" {
+									onewordmux.Lock()
+									ow := onewordkeymap[word]
+									onewordmux.Unlock()
+									ow = append(ow, cs)
+									onewordmux.Lock()
+									onewordkeymap[word] = ow
+									onewordmux.Unlock()
+								}
+							}
+						}
+					} else {
+						found := false
+						gmux.Lock()
+						consarr := directsubsmap[key]
+						gmux.Unlock()
+						for _, con := range consarr {
+							if con == &cons {
+								found = true
+								break
+							}
+						}
+						if !found {
+							consarr = append(consarr, &cons)
+							gmux.Lock()
+							directsubsmap[key] = consarr
+							gmux.Unlock()
 						}
 					}
 				}
 			case pb.ConsumeRequest_UNSUBSCRIBE:
 				for _, key := range req.Keys {
-					removed := false
-					for i, s := range cons.subtcell {
-						if key == s.key {
-							cons.subtcell = removeConSlice(cons.subtcell, i)
-							removed = true
-							break
+					if strings.Contains(key, "#") || strings.Contains(key, "*") {
+						ptrmux.Lock()
+						cs := ptrsubsmap[key]
+						ptrmux.Unlock()
+						if cs != nil {
+							for i, con := range cs.consumers {
+								if con == &cons {
+									clen := len(cs.consumers)
+									cs.consumers[i] = cs.consumers[clen-1]
+									cs.consumers = cs.consumers[:clen-1]
+									ptrmux.Lock()
+									ptrsubsmap[key] = cs
+									ptrmux.Unlock()
+									break
+								}
+							}
+							for _, word := range strings.Split(key, ".") {
+								if word != "#" && word != "*" {
+									onewordmux.Lock()
+									ow := onewordkeymap[word]
+									onewordmux.Unlock()
+									for i, con := range ow {
+										if con == cs {
+											clen := len(ow)
+											ow[i] = ow[clen-1]
+											ow = ow[:clen-1]
+											onewordmux.Lock()
+											onewordkeymap[word] = ow
+											onewordmux.Unlock()
+											break
+										}
+									}
+								}
+							}
 						}
-					}
-					if !removed {
-						for i, s := range cons.subtstar {
-							if key == s.key {
-								cons.subtstar = removeConSlice(cons.subtstar, i)
-								removed = true
+					} else {
+						found := false
+						gmux.Lock()
+						consarr := directsubsmap[key]
+						gmux.Unlock()
+						for i, con := range consarr {
+							if con == &cons {
+								conlen := len(consarr)
+								consarr[i] = consarr[conlen-1]
+								consarr = consarr[:conlen-1]
+								found = true
 								break
 							}
 						}
-					}
-					if !removed {
-						for i, _ := range cons.subkeys {
-							if key == cons.subkeys[i] {
-								ls := len(cons.subkeys)
-								cons.subkeys[i] = cons.subkeys[ls-1]
-								cons.subkeys = cons.subkeys[:ls-1]
-								break
-							}
+						if found {
+							gmux.Lock()
+							directsubsmap[key] = consarr
+							gmux.Unlock()
 						}
 					}
 				}
@@ -207,41 +262,39 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 func processMsgQueue() {
 	for {
 		req := <-msgQueueChan
-		for _, cons := range consRegistry {
-			if cons != nil {
-				match := false
-				for _, sub := range cons.subtcell {
-					if sub != nil {
-						if sub.matcher != nil {
-							if sub.matcher.MatchString(req.Key) {
-								match = true
-								break
-							}
-						}
-					}
+		if req != nil {
+			gmux.Lock()
+			consarr, ok := directsubsmap[req.Key]
+			gmux.Unlock()
+			if ok {
+				for _, cons := range consarr {
+					cons.queue <- req
 				}
-				if !match {
-					for _, sub := range cons.subtstar {
-						if sub != nil {
-							if sub.matcher != nil {
-								if sub.matcher.MatchString(req.Key) {
-									match = true
-									break
+			} else {
+				constosend := make([]*consumer, 5)
+				for _, word := range strings.Split(req.Key, ".") {
+					onewordmux.Lock()
+					ow := onewordkeymap[word]
+					onewordmux.Unlock()
+					for _, con := range ow {
+						if con != nil {
+							if con.matcher.MatchString(req.Key) {
+								for _, c := range con.consumers {
+									found := false
+									for _, cts := range constosend {
+										if cts == c {
+											found = true
+											break
+										}
+									}
+
+									if !found {
+										constosend = append(constosend, c)
+									}
 								}
 							}
 						}
 					}
-				}
-				if !match {
-					for _, key := range cons.subkeys {
-						if key == req.Key {
-							match = true
-							break
-						}
-					}
-				}
-				if match {
-					cons.queue <- req
 				}
 			}
 		}
@@ -266,10 +319,10 @@ for _, sub := range cons.subtcell {
 					}
 				}
 */
-func removeConSlice(s []*consub, i int) []*consub {
+/*func removeConSlice(s []*consub, i int) []*consub {
 	s[i] = s[len(s)-1]
 	return s[:len(s)-1]
-}
+}*/
 
 func makeMatcher(s string) *regexp.Regexp {
 	spl := strings.Split(s, ".")
@@ -312,6 +365,7 @@ func getMatcher() func(string) *regexp.Regexp {
 }
 
 func main() {
+
 	go printStats()
 	fmt.Println("numcpu", runtime.NumCPU())
 	fmt.Println("gomaxprocs", runtime.GOMAXPROCS(-1))
@@ -330,7 +384,7 @@ func main() {
 
 	fmt.Println("Server started successfully at port ", port)
 
-	for i := 0; i < 100000; i++ {
+	for i := 0; i < 1000; i++ {
 		go processMsgQueue()
 	}
 	// and start...
