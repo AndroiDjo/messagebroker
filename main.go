@@ -12,7 +12,10 @@ import (
 
 	"runtime"
 
+	_ "net/http/pprof"
+
 	pb "github.com/AndroiDjo/newbroker/mbproto"
+	xxh "github.com/cespare/xxhash"
 	"google.golang.org/grpc"
 )
 
@@ -28,9 +31,9 @@ type consumer struct {
 	mux   sync.Mutex
 }
 
-var directsubsmap map[string][]*consumer = make(map[string][]*consumer)
-var ptrsubsmap map[string]*consub = make(map[string]*consub)
-var onewordkeymap map[string][]*consub = make(map[string][]*consub)
+var directsubsmap map[uint64][]*consumer = make(map[uint64][]*consumer)
+var ptrsubsmap map[uint64]*consub = make(map[uint64]*consub)
+var onewordkeymap map[uint64][]*consub = make(map[uint64][]*consub)
 
 var msgQueueChan chan *pb.ProduceRequest = make(chan *pb.ProduceRequest, 10000)
 var consRegistry []*consumer
@@ -133,10 +136,11 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 			switch req.Action {
 			case pb.ConsumeRequest_SUBSCRIBE:
 				for _, key := range req.Keys {
+					keyhash := xxh.Sum64String(key)
 					if strings.Contains(key, "#") || strings.Contains(key, "*") {
 						//ptrsubsmap
 						ptrmux.Lock()
-						cs := ptrsubsmap[key]
+						cs := ptrsubsmap[keyhash]
 						ptrmux.Unlock()
 						if cs != nil {
 							found := false
@@ -150,22 +154,23 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 								cs.consumers = append(cs.consumers, &cons)
 								// TODO: check to not write back to ptrsubsmap
 								ptrmux.Lock()
-								ptrsubsmap[key] = cs
+								ptrsubsmap[keyhash] = cs
 								ptrmux.Unlock()
 							}
 						} else {
 							cs = &consub{matcher: makeMatcher(key), consumers: []*consumer{&cons}}
 							ptrmux.Lock()
-							ptrsubsmap[key] = cs
+							ptrsubsmap[keyhash] = cs
 							ptrmux.Unlock()
 							for _, word := range strings.Split(key, ".") {
 								if word != "#" && word != "*" {
+									wordhash := xxh.Sum64String(word)
 									onewordmux.Lock()
-									ow := onewordkeymap[word]
+									ow := onewordkeymap[wordhash]
 									onewordmux.Unlock()
 									ow = append(ow, cs)
 									onewordmux.Lock()
-									onewordkeymap[word] = ow
+									onewordkeymap[wordhash] = ow
 									onewordmux.Unlock()
 								}
 							}
@@ -173,7 +178,7 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 					} else {
 						found := false
 						gmux.Lock()
-						consarr := directsubsmap[key]
+						consarr := directsubsmap[keyhash]
 						gmux.Unlock()
 						for _, con := range consarr {
 							if con == &cons {
@@ -184,19 +189,20 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 						if !found {
 							consarr = append(consarr, &cons)
 							gmux.Lock()
-							directsubsmap[key] = consarr
+							directsubsmap[keyhash] = consarr
 							gmux.Unlock()
 						}
 					}
 				}
 			case pb.ConsumeRequest_UNSUBSCRIBE:
 				for _, key := range req.Keys {
+					keyhash := xxh.Sum64String(key)
 					if strings.Contains(key, "#") || strings.Contains(key, "*") {
 						ptrmux.Lock()
-						cs := ptrsubsmap[key]
+						cs := ptrsubsmap[keyhash]
 						ptrmux.Unlock()
 						if cs != nil {
-							for i, con := range cs.consumers {
+							/*for i, con := range cs.consumers {
 								if con == &cons {
 									clen := len(cs.consumers)
 									cs.consumers[i] = cs.consumers[clen-1]
@@ -206,11 +212,12 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 									ptrmux.Unlock()
 									break
 								}
-							}
+							}*/
 							for _, word := range strings.Split(key, ".") {
 								if word != "#" && word != "*" {
+									wordhash := xxh.Sum64String(word)
 									onewordmux.Lock()
-									ow := onewordkeymap[word]
+									ow := onewordkeymap[wordhash]
 									onewordmux.Unlock()
 									for i, con := range ow {
 										if con == cs {
@@ -218,18 +225,22 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 											ow[i] = ow[clen-1]
 											ow = ow[:clen-1]
 											onewordmux.Lock()
-											onewordkeymap[word] = ow
+											onewordkeymap[wordhash] = ow
 											onewordmux.Unlock()
 											break
 										}
 									}
 								}
 							}
+							cs = nil
+							ptrmux.Lock()
+							ptrsubsmap[keyhash] = nil
+							ptrmux.Unlock()
 						}
 					} else {
 						found := false
 						gmux.Lock()
-						consarr := directsubsmap[key]
+						consarr := directsubsmap[keyhash]
 						gmux.Unlock()
 						for i, con := range consarr {
 							if con == &cons {
@@ -242,7 +253,7 @@ func (s server) Consume(srv pb.MessageBroker_ConsumeServer) error {
 						}
 						if found {
 							gmux.Lock()
-							directsubsmap[key] = consarr
+							directsubsmap[keyhash] = consarr
 							gmux.Unlock()
 						}
 					}
@@ -263,38 +274,45 @@ func processMsgQueue() {
 	for {
 		req := <-msgQueueChan
 		if req != nil {
+			keyhash := xxh.Sum64String(req.Key)
 			gmux.Lock()
-			consarr, ok := directsubsmap[req.Key]
+			consarr, ok := directsubsmap[keyhash]
 			gmux.Unlock()
 			if ok {
 				for _, cons := range consarr {
 					cons.queue <- req
 				}
-			} else {
-				constosend := make([]*consumer, 5)
-				for _, word := range strings.Split(req.Key, ".") {
-					onewordmux.Lock()
-					ow := onewordkeymap[word]
-					onewordmux.Unlock()
-					for _, con := range ow {
-						if con != nil {
-							if con.matcher.MatchString(req.Key) {
-								for _, c := range con.consumers {
-									found := false
-									for _, cts := range constosend {
-										if cts == c {
-											found = true
-											break
-										}
-									}
+			}
 
-									if !found {
-										constosend = append(constosend, c)
+			constosend := make([]*consumer, 1)
+			for _, word := range strings.Split(req.Key, ".") {
+				wordhash := xxh.Sum64String(word)
+				onewordmux.Lock()
+				ow := onewordkeymap[wordhash]
+				onewordmux.Unlock()
+				for _, con := range ow {
+					if con != nil {
+						if con.matcher.MatchString(req.Key) {
+							for _, c := range con.consumers {
+								found := false
+								for _, cts := range constosend {
+									if cts == c {
+										found = true
+										break
 									}
+								}
+
+								if !found {
+									constosend = append(constosend, c)
 								}
 							}
 						}
 					}
+				}
+			}
+			for _, cons := range constosend {
+				if cons != nil {
+					cons.queue <- req
 				}
 			}
 		}
@@ -365,14 +383,18 @@ func getMatcher() func(string) *regexp.Regexp {
 }
 
 func main() {
-
-	go printStats()
+	//runtime.SetBlockProfileRate(1)
+	//go printStats()
 	fmt.Println("numcpu", runtime.NumCPU())
 	fmt.Println("gomaxprocs", runtime.GOMAXPROCS(-1))
 	/*runtime.GOMAXPROCS(256)
 	fmt.Println("gomaxprocs", runtime.GOMAXPROCS(-1))*/
 
-	port := ":80"
+	port := ":8080"
+	/*go func() {
+		log.Println(http.ListenAndServe("localhost:8080", nil))
+	}()*/
+
 	lis, err := net.Listen("tcp", port)
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
