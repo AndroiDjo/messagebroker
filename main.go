@@ -14,7 +14,7 @@ import (
 
 	_ "net/http/pprof"
 
-	pb "github.com/AndroiDjo/newbroker/mbproto"
+	pb "github.com/AndroiDjo/messagebroker/mbproto"
 	xxh "github.com/cespare/xxhash"
 	"google.golang.org/grpc"
 )
